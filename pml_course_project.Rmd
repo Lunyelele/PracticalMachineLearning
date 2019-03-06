@@ -1,0 +1,285 @@
+---
+title: "PML Course Project Assigment"
+author: "Luis García Amor"
+date: "6 de marzo de 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = F,warning = F)
+```
+
+## Preliminaries
+
+### Background
+
+From the assigment:
+
+"*Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).*"
+
+### Resources
+
+R version 3.4.3 (2017-11-30)
+
+The following packages have been used:
+
+* caret 6.0-81
+* ggplot2 2.2.1
+* cowplot 0.9.4
+* ggcorrplot 0.1.2
+* doParallel 1.0.14
+
+```{r resources,echo=FALSE}
+library(caret)
+library(ggplot2)
+library(cowplot)
+library(ggcorrplot)
+library(doParallel)
+```
+
+### Data
+
+```{r load_data}
+trainSet <- read.csv("pml-training.csv", stringsAsFactors = F)
+```
+
+
+## Tidying up data
+
+### Discarding unuseful variables
+
+In a quick inspection of the data set some variables for which no predictive value is expected are first identified:
+
+* _X_: contains just the row number.
+* _user_name_: the prediction algorithm should work well irrespective of who is the subject.
+* Variables referred to time or window: they seem related to the particular experimental framework so they cannot be expected to allow for generalization.
+
+For the predictand _classe_ it is more convenient to treat it as a factor.
+
+At this stage, the remaining character variables are such because of some flags like "" (void) or "#DIV/0!" have prevented their reading as numbers. I will force those variables to numeric (generating _NAs_ by coercion in the process).
+
+Turns out that most of those variables forced to numeric have a very low fraction of valid data (most of the time data are missing in same rows). These variables have been discarded as well.
+
+```{r tidying_up_1}
+# Drop non-predictive variables
+trainSet <- subset(trainSet,select=-X)
+trainSet <- subset(trainSet,select=-user_name)
+trainSet <- subset(trainSet,select = -c(raw_timestamp_part_1,
+                                        raw_timestamp_part_2,
+                                        cvtd_timestamp))
+trainSet <- subset(trainSet,select = -c(num_window,
+                                        new_window))
+
+# Convert predictand to factor
+trainSet$classe <- factor(trainSet$classe)
+
+# Force to numeric
+var.chr <- which(sapply(trainSet,is.character))
+trainSet[var.chr] <- lapply(trainSet[var.chr],as.numeric)
+
+# Drop 100 features that have more than 95% of missing data
+noData <- apply(is.na(trainSet),2,sum)/nrow(trainSet)
+trainSet <- trainSet[,!noData>0.95]
+```
+
+As a result, we end up with 52 numeric features and a 5 class categorical predictand (*classe*)
+
+
+### Inspecting the data
+
+By means of density plots like the one showed below, a general impression of the features behaviour is obtained. Remarkably, this inspection has allowed to identify some clear outliers in some of the *gyros_* features, and also in *magnet_dumbbell_y*.  
+
+```{r inspecting_data,echo=FALSE}
+gpl <- list()
+for(k in 1:52){
+  feat <- names(trainSet)[k]
+  gpl[[length(gpl)+1]] <- ggplot(trainSet) + 
+    geom_density(aes_string(feat))+
+    labs(title=feat,x=NULL,y=NULL)
+  names(gpl)[length(gpl)] <- feat
+}
+plot_grid(plotlist=gpl[25:36],ncol=4)
+
+```
+
+These extreme outliers are easily located in just two samples, which have been  discarded from de data set:
+
+```{r discard_outliers}
+trainSet <- trainSet[-c(5373,9274),]
+```
+
+The presence of some other not so extreme outliers seems clear. Those could have been identified by more sophisticated techniques. Instead of that, prediction algorithms robust to outliers will be chosen for the model.
+
+## Training and validation subsets
+
+As the number of observations is large (19620 samples with 52 features) the data set has been divided into two subsets:
+
+ * Trainig subset, on which the models are to be trained 
+ * Validation subset by means of which the accuracy of the models in out of sample predictions will be assessed. 
+ 
+30% of samples have been hold out for validation:
+
+```{r data_partition}
+set.seed(54321)
+inTrain <- createDataPartition(trainSet$classe,p=0.7,list=F)
+
+training <- trainSet[inTrain,]
+validation <- trainSet[-inTrain,]
+```
+
+
+## Some exploratory analysis
+
+Using the training subset some exploration of the data has been performed in order to better ground the modeling strategy.  
+
+### Predictand evenly distributed
+
+All of the 5 categories of the predictand are fairly well represented in the training subset:  
+
+```{r classe_table}
+table(training$classe)
+```
+
+### Correlation of features
+
+A cross correlation matrix has been computed. Most of the inter-feature correlations are somehow weak, but there exist some pairs of highly correlated features, as can be seen in the plot below.
+
+```{r cross_correlation,echo=FALSE}
+corr.feat <- cor(training[,1:52])
+ggcorrplot(corr.feat)
+```
+
+### Predictand - feature relationships
+
+Plots like the one below have been used to try to picture how features relate to predictand. Some fetures seem to display individual discriminant capacity to some extent. Features have varied and quite irregular distributions, many of them multimodal, as could be seen in some other plots above. Not much more to say from these plots, though.
+
+```{r density_plots}
+featurePlot(x=training[,1:4],y=training$classe,plot="density",
+            scales = list(x = list(relation="free"), 
+                          y = list(relation="free")),
+            layout=c(2,2),
+            autokey=T)
+```
+
+## Modeling
+
+### Predcition algorithm
+
+Due to the observed characteristics of the training subset (many, differently distributed features, some ouliers, some pairs of highly correlated features), a suitable algorithm should show the following traits about features: 
+
+* Robust to outliers
+* Robust to non-normality
+* In-built feature selection capacity
+
+Algorithms based on trees seem suitable in this framework. Gradient boosting and random forest will be the algorithms to be tried for these prediction task.
+
+### Cross-validation design
+
+Apart from having held out a validation subset, internal cross validation has been used to tune model parameters within the training process. A k-fold cross-validation scheme has been chosen with 5 folds and 5 repetitions:
+
+```{r cv_design}
+fitControl <- trainControl(method="repeatedcv",number=5,repeats=5)
+```
+
+### Training the models
+
+Below, the code used to train the models and the results are shown:
+
+```{r load_models,echo=FALSE}
+load("v4.RData")
+```
+
+* **Gradient boosting**
+
+```{r training_gbm, eval=FALSE}
+set.seed(12345)
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+modFit.gbm <- train(classe ~.,data=training,method="gbm",
+                    trControl=fitControl)
+stopCluster(cl)
+
+print(modFit.gbm)
+```
+
+```{r, echo=FALSE}
+print(modFit.gbm)
+```
+
+* **Random forest**
+
+```{r training_rf, eval=FALSE}
+set.seed(12345)
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+modFit.rf <- train(classe ~.,data=training,method="rf",
+                   trControl=fitControl)
+stopCluster(cl)
+
+print(modFit.rf)
+```
+
+```{r, echo=FALSE}
+print(modFit.rf)
+```
+
+
+### Performance of the models
+
+The validation subset has been used to assess the accuracy of the two models by means of confusion matrices:
+
+* **Gradient boosting**
+
+```{r validation_gbm}
+pred.gbm <- predict(modFit.gbm,validation)
+confusionMatrix(pred.gbm,validation$classe)
+```
+
+* **Random forest**
+
+```{r validation_rf}
+pred.rf <- predict(modFit.rf,validation)
+confusionMatrix(pred.rf,validation$classe)
+```
+
+Both models perform quite well in the validation test, random forest showing a significant higher accuracy.
+
+The accuracy that can be expected for cases out of the training set is that of the validation predictions showed, provided that the samples belong to some of the same sujects in the experiment. The models have not been tried for other subjects so the accuracy cannot be assessed in that case and it can be expected to be lower. More on this in the _Final note_ below.  
+
+
+## Test prediction
+
+The prediction on the test set is computed:
+
+* **Gradient boosting**
+
+```{r prediction_test_gbm}
+
+testSet <- read.csv("pml-testing.csv", stringsAsFactors = F)
+
+predTest.gbm <- predict(modFit.gbm,testSet)
+```
+
+* **Random forest**
+
+```{r prediction_test_rf}
+predTest.rf <- predict(modFit.rf,testSet)
+```
+
+Both models yield the same prediction, which is therefore taken as the test result of the project.
+
+
+## A final note
+
+The high accuracy attained by both models in the validation set (close to 0.996 for random forest) seem unnatural, at least for the real life class of experiments to which the one presented here could be thought to belong. That demands some kind of explanation.
+
+Related to this, I believe, is the fact that leave-one-subject-out cross validation schemes based on *user_name* work very poorly (various of these strategies have been tried but results are not presented here). This kind of validation seem much more suitable for assessing out-of-sample performance (how the model would perform for new subjects) and I find it a pity that I haven't been able to make them work properly for this project.
+
+Some traits of the data set are also somehow informative for their pecculiarity. For example, 100 features have missing data for most of the set. The rows in which they provide data are those in which *new_window* takes the value "yes". These features are unusable for none of the samples in the test set is a *new_window*="yes" row.
+
+All in all, I honestly believe that the answer lies in what Martin Hughes explains in this post found in the discussion forum:
+
+https://www.coursera.org/learn/practical-machine-learning/discussions/weeks/4/threads/7dTPsA6sEeehWA5dKEw6YA
+
+
+
